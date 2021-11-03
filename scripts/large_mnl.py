@@ -171,19 +171,23 @@ def interaction_sample(
     chooser_val, key = chooser_val_key
     total_alts = alts.shape[0]
 
-    alts_idxs = np.array(range(total_alts))
-    samp_alts_idxs = random.choice(
-        key, alts_idxs, (sample_size, ), replace=False)
+    # w = 1 / total_alts
+    # E = -np.log(random.uniform(key, shape=(total_alts,), minval=0, maxval=1))
+    # E /= w
+    # shuffled = np.argsort(E)
 
-    alts = alts[samp_alts_idxs, :]
+    shuffled = random.permutation(key, np.arange(total_alts))
+    samp_alts_idxs = shuffled[:sample_size]
+
+    alts2 = alts[samp_alts_idxs, :]
 
     # perform interaction
     idx_alt_intx = -1
-    interacted = alts[:, idx_alt_intx] / chooser_val
-    alts2 = alts.at[:, idx_alt_intx].set(interacted)
+    interacted = alts2[:, idx_alt_intx] / chooser_val
+    alts3 = alts2.at[:, idx_alt_intx].set(interacted)
 
     # compute probs
-    logits = np.dot(alts2, coeffs.T)
+    logits = np.dot(alts3, coeffs.T)
     probas = softmax(logits)
     probas = probas.flatten()
 
@@ -194,9 +198,11 @@ def interaction_sample(
     del logits
     del probas
     del alts2
+    del alts3
     del interacted
+    del shuffled
+    # del E
     del samp_alts_idxs
-    del alts_idxs
 
     return max_prob, pct_probs_gt_pop_mean
 
@@ -232,7 +238,7 @@ def interaction(alts, coeffs, pop_mean_prob, chooser_val_key):
 
 def get_probs(
         choosers, alts, key, sample_size,
-        batched=False, max_mct_size=750000000):
+        batched=False, max_mct_size=1200000000):
     """VMAP the interaction function over all choosers' values"""
 
     num_choosers = choosers.shape[0]
@@ -274,9 +280,7 @@ def get_probs(
                 coeffs,
                 pop_mean_prob)
 
-        results = lax.map(
-            vmap(partial_interaction),
-            (choosers, keys))
+        results = lax.map(vmap(partial_interaction), (choosers, keys))
         results = [
             result.reshape((num_choosers, )) for result in results]
 
