@@ -1,9 +1,14 @@
-import numpy as onp
-from jax import jit, vmap, lax, remat
+from jax import jit, vmap, lax, remat, devices, device_put
 import jax.numpy as np
 import jax.random as random
 from functools import partial
 import time
+import numpy as onp
+from tqdm import tqdm
+
+N_SAMP_RATES = 10
+ERR_METRIC_ROW_SIZE = 19
+CHOOSER_PROB_ROW_SIZE = 6
 
 
 def softmax(u, scale=1, corr_factor=1):
@@ -21,7 +26,7 @@ def softmax(u, scale=1, corr_factor=1):
     ----------
     (array) Probabilites for each alternative
     """
-    exp_utility = np.exp(scale * u)
+    exp_utility = np.exp(u * scale)
     sum_exp_utility = np.sum(exp_utility * corr_factor, keepdims=True)
     proba = exp_utility / sum_exp_utility
     return proba
@@ -46,100 +51,6 @@ def logsums(u, scale=1, axis=1, corr_factor=1):
         np.sum(np.exp(scale * u) * corr_factor, axis=axis))
 
 
-def get_mct(choosers, alts, var_mats=None, chooser_alts=None):
-
-    num_choosers = choosers.shape[0]
-    num_alts = alts.shape[0]
-    sample_size = chooser_alts.shape[1]
-
-    if chooser_alts is None:
-        mct = np.tile(alts, (num_choosers, 1))
-        mct = np.hstack((mct, choosers.repeat(num_alts)))
-    else:
-        mct = np.vstack(
-            [alts[chooser_alts[i, :], :] for i in range(num_choosers)])
-        mct = np.hstack((mct, choosers.repeat(sample_size).reshape(-1, 1)))
-
-    return mct
-
-
-class large_mnl():
-    """
-    Differentiable approach for multinomial logit with large alternative set
-    """
-
-    def __init__(
-            self,
-            model_object=None,
-            coeffs=None,
-            n_choosers=None,
-            n_alts=None):
-        self.weights = coeffs
-        self.n_choosers = n_choosers
-        self.n_alts = n_alts
-        # self.constrains  = constrains
-        # TO DO: yaml file
-
-    def utilities(self, x):
-        """ Calculates the utility fuction of weights w and data x
-        Parameters:
-        ------------
-        x : Jax 2d array. Column names must match coefficient names. If a Jax
-            array, order of columns should be the same order as the coeffient
-            names.
-
-        Return:
-        ------------
-        2-d jax numpy array with utilities for eahc alternative.
-        """
-
-        w = self.weights
-        n = self.n_choosers
-        j = self.n_alts
-        return np.dot(x, w.T).reshape(n, j)
-
-    def probabilities(self, x, scale=1, corr_factor=1):
-        """ Estimates the probabilities for each chooser x alternative
-        """
-        utils = self.utilities(x)
-        probs = vmap(
-            softmax, in_axes=(0, None, None))(utils, scale, corr_factor)
-        return probs
-
-    def logsum(self, x):
-        """ Estimates the maximum expected utility for all alternatives in the
-        choice set, with Scale parameter normalized to 1.
-        """
-        utils = self.utilities(x)
-        return vmap(logsums)(utils)
-
-    def simulation(self, x, key):
-        """
-        Monte Carlo simulation.
-
-        Parameters
-        ----------
-        x: 2-d Jax numpy array
-        key: jax PRNG Key object
-
-        Return
-        -------
-        - numpy.array
-
-        """
-        utils = self.utilities(x)
-        shape = utils.shape
-        keys = random.split(key, shape[0])
-
-        @jit
-        def single_simulation(u, key):
-            return random.categorical(key, u)
-
-        choices = vmap(single_simulation, in_axes=(0, 0))(utils, keys)
-        return choices  # Assuming alternative name starts at 0
-
-
-@jit
 def swop_exp(key, alts_idxs):
 
     num_alts = alts_idxs.shape[0]
@@ -152,93 +63,534 @@ def swop_exp(key, alts_idxs):
     return shuffled
 
 
-@partial(jit, static_argnums=[3])
-def interaction_sample(
-        alts, coeffs, pop_mean_prob, sample_size, chooser_val_key):
-
-    chooser_val, key = chooser_val_key
-
-    # perform interaction
-    idx_alt_intx = -1
-    interacted = alts[:, idx_alt_intx] / chooser_val
-    alts2 = alts.at[:, idx_alt_intx].set(interacted)
-
-    # compute probs
-    true_logits = np.dot(alts2, coeffs.T)
-    true_probs = softmax(true_logits)
-    true_probs = true_probs.flatten()
-
-    # sample
-    total_alts = alts.shape[0]
-    alts_idxs = np.arange(total_alts)
-    shuffled = swop_exp(key, alts_idxs)
-    samp_alts_idxs = shuffled[:sample_size]
-    alts3 = alts2[samp_alts_idxs, :]
-
-    # compute sample probs
-    samp_logits = np.dot(alts3, coeffs.T)
-    samp_probs = softmax(samp_logits)
-    samp_probs = samp_probs.flatten()
-
-    # compute metrics
-
-    # pct alts with probs greater than true mean prob
-    pct_probs_gt_pop_mean = np.sum(samp_probs > pop_mean_prob) / sample_size
-
-    # true max vs true prob sampled max
-    max_idx = np.nanargmax(samp_probs)
-    true_idx = samp_alts_idxs[max_idx]
-
-    # corrected max prob vs true max
-    max_prob_corr = samp_probs[max_idx] * (sample_size / total_alts)
-
-    del true_logits
-    del true_probs
-    del samp_logits
-    del samp_probs
-    del alts2
-    del alts3
-    del interacted
-    del shuffled
-    del alts_idxs
-    del samp_alts_idxs
-
-    return max_prob_corr, pct_probs_gt_pop_mean, true_idx
+@jit
+def all_samp_idxs(key, alts_idxs):
+    samps = random.shuffle(key, alts_idxs)
+    return samps
 
 
 @jit
-def interaction(alts, coeffs, pop_mean_prob, chooser_val_key):
-    """ Compute logit probs with NO SAMPLING of alts
-    """
-    chooser_val, key = chooser_val_key
-    # total_alts = alts.shape[0]
+def interact_choosers_alts(chooser_val, alts, alt_intx_idx=-1):
 
-    # perform interaction
     idx_alt_intx = -1
-    interacted = alts[:, idx_alt_intx] / chooser_val
+    interacted = np.sqrt(alts[:, idx_alt_intx] / chooser_val)
     alts2 = alts.at[:, idx_alt_intx].set(interacted)
 
+    return alts2
+
+
+def interaction_sample_utils(
+        alts, coeffs, scale, sample_size, chooser_val_key):
+    """ Compute logit utils with SAMPLING of alts.
+    """
+    chooser_val, key = chooser_val_key
+
+    # perform interaction
+    data = interact_choosers_alts(chooser_val, alts)
+
+    # sample
+    total_alts = data.shape[0]
+    alts_idxs = np.arange(total_alts)
+    shuffled = swop_exp(key, alts_idxs)
+
+    samp_alts_idxs = shuffled[:sample_size]
+    data = data[samp_alts_idxs, :]
+
+    # compute utils
+    logits = np.dot(data, coeffs.T) * scale
+
+    del data
+    del alts_idxs
+    del shuffled
+
+    return samp_alts_idxs, logits
+
+
+@jit
+def interaction_utils(alts, coeffs, scale, chooser_val):
+    """ Compute logit utils NO SAMPLING of alts.
+    """
+
+    # perform interaction
+    data = interact_choosers_alts(chooser_val, alts)
+
     # compute probs
-    logits = np.dot(alts2, coeffs.T)
-    probas = softmax(logits)
+    logits = np.dot(data, coeffs.T) * scale
+    del data
+
+    return logits
+
+
+@partial(jit, static_argnums=[2,3])
+def interaction_sample_probs(
+        alts, coeffs, scale, sample_size, chooser_val_key):
+
+    samp_alt_idxs, utils = interaction_sample_utils(
+        alts, coeffs, scale, sample_size, chooser_val_key)
+
+    samp_probs = softmax(utils)  # scale already incorporated into utils
+    samp_probs = samp_probs.flatten()
+
+    del utils
+
+    return samp_alt_idxs, samp_probs
+
+
+@jit
+def interaction_probs(alts, coeffs, scale, chooser_val):
+    """ Compute logit probs with NO SAMPLING of alts.
+
+    Returns probs for all alts for each chooser. Will prob run out of
+    memory around n_alts == 20000.
+    """
+    # total_alts = alts.shape[0]
+
+    utils = interaction_utils(alts, coeffs, scale, chooser_val)
+
+    probas = softmax(utils)  # scale already incorporated into utils
     probas = probas.flatten()
 
-    # # compute metrics
-    # pct_probs_gt_pop_mean = np.sum(probas > pop_mean_prob) / total_alts
-    # max_prob = np.nanmax(probas)
-
-    # del probas
-    del logits
-    del alts2
-    del interacted
+    # cleanup
+    del utils
 
     return probas
 
 
+
+@jit
+def interaction_probs_all(alts, coeffs, scale, chooser_val_key):
+    """ 
+    """
+    total_alts = alts.shape[0]
+    chooser_val, key = chooser_val_key
+
+    # interact choosers/alts
+    full_data = interact_choosers_alts(chooser_val, alts)
+
+    # interact and take dot product
+    full_utils = np.dot(full_data, coeffs.T) * scale
+
+    # true probs
+    true_probs = softmax(full_utils).flatten()
+
+    # sample splits
+    alts_idxs = np.arange(total_alts)
+    shuffled = swop_exp(key, alts_idxs)
+    samples = np.array_split(shuffled, N_SAMP_RATES)
+
+    result_arr = np.zeros((N_SAMP_RATES, total_alts), dtype=np.float32)
+    samp_alts_idxs = np.asarray([], dtype=int)
+    for i, sample in enumerate(samples):
+        
+        sample_rate = (i + 1) / N_SAMP_RATES
+        sample_size = total_alts * sample_rate
+        samp_alts_idxs = np.concatenate((samp_alts_idxs, sample))
+
+        # compute sample probs
+        samp_utils = full_utils[samp_alts_idxs]
+        samp_probs = softmax(samp_utils).flatten()
+        del samp_utils
+
+        # sparsify
+        probs_samp_sparse = np.zeros_like(full_utils, dtype=np.float32)
+        probs_samp_sparse = probs_samp_sparse.at[samp_alts_idxs].set(samp_probs)
+        del samp_probs
+
+        result_arr = result_arr.at[i, :].set(probs_samp_sparse)
+
+        del probs_samp_sparse
+
+    # cleanup
+    del full_utils
+    del full_data
+    del alts_idxs
+    del shuffled
+    del samples
+    del samp_alts_idxs
+
+    return result_arr
+
+
+@jit
+def interaction_prob_errs_all(alts, coeffs, scale, chooser_val_key):
+    """ 
+    """
+    total_alts = alts.shape[0]
+    chooser_val, key = chooser_val_key
+
+    full_data = interact_choosers_alts(chooser_val, alts)
+
+    true_utils = interaction_utils(alts, coeffs, scale, chooser_val)
+    true_probs = softmax(true_utils, scale).flatten()
+    true_probs_sd = true_probs.std()
+
+    # sample splits
+    alts_idxs = np.arange(total_alts)
+    shuffled = swop_exp(key, alts_idxs)
+    samples = np.array_split(shuffled, N_SAMP_RATES)
+
+    result_arr = np.zeros((total_alts, 10), dtype=np.float16)
+    samp_alts_idxs = np.asarray([], dtype=int)
+    for i, sample in enumerate(samples):
+        
+        sample_rate = (i + 1) / N_SAMP_RATES
+        sample_size = total_alts * sample_rate
+        samp_alts_idxs = np.concatenate((samp_alts_idxs, sample))
+        samp_data = full_data[samp_alts_idxs, :]
+
+        # compute sample probs
+        samp_utils = np.dot(samp_data, coeffs.T) * scale
+        samp_probs = softmax(samp_utils).flatten()
+        
+        # sparsify
+        probs_samp_sparse = np.zeros_like(true_probs)
+        probs_samp_sparse = probs_samp_sparse.at[samp_alts_idxs].set(samp_probs)
+
+        # errs
+        result_arr = result_arr.at[:, i].set(np.float16(probs_samp_sparse - true_probs))
+
+        del samp_data
+        del samp_utils
+        del samp_probs
+        del probs_samp_sparse
+
+    # cleanup
+    del true_utils
+    del full_data
+    del true_probs
+    del alts_idxs
+    del shuffled
+    del samples
+    del samp_alts_idxs
+
+    return result_arr
+
+
+def get_probs(
+        choosers, alts, coeffs, key, sample_size=None,
+        scale=1, utils=False, batched=False, sum_probs=False, max_mct_size=1200000000):
+    """ Original function to get jitted prob metrics
+
+    DEPRECATED now bc the jitted funcs return all chooser alt-probs, which
+    will run out of memory at ~20k alts.
+    """
+    now = time.time()
+    num_choosers = choosers.shape[0]
+    key_dim = key.shape[0]
+    keys = random.split(key, num_choosers)
+    num_alts = alts.shape[0]
+    mct_size = num_choosers * num_alts
+    batch_size_dict = {20000: 5, 200000: 1000, 2000000: 50000}
+
+    if sample_size:
+        gpu_func = interaction_sample_probs
+        if utils:
+            gpu_func = interaction_sample_utils
+    else:
+        gpu_func = interaction_probs
+        if utils:
+            gpu_func = interaction_utils
+    if (batched) & (mct_size > max_mct_size):
+
+        n_chooser_batches = batch_size_dict[num_alts]
+        choosers_per_batch = int(num_choosers / n_chooser_batches)
+        if sample_size is None:
+            print(
+                "Computing probabilities in {0} batches of {1} choosers".format(
+                    n_chooser_batches, choosers_per_batch))
+        choosers = choosers.reshape(
+            (n_chooser_batches, choosers_per_batch))
+        keys = keys.reshape(
+            (n_chooser_batches, choosers_per_batch, key_dim))
+
+        if sample_size:
+            partial_interaction = partial(
+                gpu_func,
+                alts,
+                coeffs,
+                scale,
+                sample_size)
+            if sum_probs:
+                results = []
+                for i in tqdm(range(n_chooser_batches)):
+                    chooser_batch = choosers[i]
+                    key_batch = keys[i]
+                    alt_idxs, probs = vmap(partial_interaction)((chooser_batch, key_batch))
+                    probs_samp_sparse = onp.zeros((choosers_per_batch, num_alts))
+                    probs_samp_sparse[
+                        np.arange(choosers_per_batch).repeat(sample_size),
+                        alt_idxs.flatten()] = probs.flatten()
+                    result = probs_samp_sparse.sum(axis=0)
+                    results.append(result)
+                results = np.array(results).sum(axis=0)
+            else:
+                alt_idxs, probs = lax.map(
+                    vmap(partial_interaction), (choosers, keys))
+                results = probs.reshape((num_choosers, num_alts))
+        else:
+            partial_interaction = partial(
+                gpu_func,
+                alts,
+                coeffs,
+                scale)
+            if sum_probs:
+                results = []
+                for chooser_batch in choosers:
+                    probs = vmap(partial_interaction)(chooser_batch)
+                    result = probs.sum(axis=0)
+                    results.append(result)
+                results = np.array(results).sum(axis=0)
+            else:
+                probs = lax.map(
+                    vmap(partial_interaction), (choosers))
+                results = results.reshape((num_choosers, num_alts))
+
+    else:
+        if sample_size:
+            alt_idxs, probs = vmap(
+                gpu_func,
+                in_axes=(None, None, None, None, 0))(
+                alts, coeffs, scale, sample_size,
+                (choosers, keys))
+            if sum_probs:
+                results = onp.zeros((num_choosers, num_alts))
+                results[
+                    np.arange(num_choosers).repeat(sample_size),
+                    alt_idxs.flatten()] = probs.flatten()
+        else:
+            results = vmap(
+                gpu_func, in_axes=(None, None, None, 0))(
+                alts, coeffs, scale, (choosers))
+        if sum_probs:
+            results = results.sum(axis=0)
+    later = time.time()
+    if sample_size is None:
+        print(
+            "Took {0} s to compute true probabilities.".format(
+                np.round(later - now), 1))
+
+    return results
+
+
+def get_all_probs(
+        choosers, alts, coeffs, key,
+        scale=1, batched=False, verbose=True,
+        max_mct_size=1200000000):
+    """ Original function to get jitted probs
+    """
+    now = time.time()
+    num_choosers = choosers.shape[0]
+    key_dim = key.shape[0]
+    keys = random.split(key, num_choosers)
+    num_alts = alts.shape[0]
+    mct_size = num_choosers * num_alts
+    batch_size_dict = {20000: 8, 200000: 750, 2000000: 75000}
+
+    gpu_func = interaction_probs_all
+    if (batched) & (mct_size > max_mct_size):
+
+        n_chooser_batches = batch_size_dict[num_alts]
+        choosers_per_batch = int(num_choosers / n_chooser_batches)
+        if verbose:
+            print(
+                "Computing probabilities in {0} batches of {1} choosers".format(
+                    n_chooser_batches, choosers_per_batch))
+        choosers = choosers.reshape(
+            (n_chooser_batches, choosers_per_batch))
+        keys = keys.reshape(
+            (n_chooser_batches, choosers_per_batch, key_dim))
+
+        partial_interaction = partial(
+            gpu_func,
+            alts,
+            coeffs,
+            scale)
+
+        # store results on cpu to preserve space on GPU for computation
+        cpu = devices("cpu")[0]
+        results = device_put(onp.zeros((10, num_alts)), device=cpu)
+
+        # process chooser batches
+        if verbose:
+            for i in tqdm(range(n_chooser_batches)):
+                chooser_batch = choosers[i]
+                key_batch = keys[i]
+                probs = vmap(partial_interaction)((chooser_batch, key_batch))
+                results = results + probs.sum(axis=0)
+                del probs
+        else:
+            for i in range(n_chooser_batches):
+                chooser_batch = choosers[i]
+                key_batch = keys[i]
+                probs = vmap(partial_interaction)((chooser_batch, key_batch))
+                results = results + probs.sum(axis=0)
+                del probs            
+
+    else:
+        results = vmap(
+            gpu_func, in_axes=(None, None, None, 0))(
+            alts, coeffs, scale, (choosers, keys))
+        results = results.sum(axis=0)
+        
+    later = time.time()
+    if verbose:
+        print(
+            "Took {0} s to compute true probabilities.".format(
+                np.round(later - now), 1))
+
+    return results
+
+
+def get_all_prob_errs(
+        choosers, alts, coeffs, key,
+        scale=1, batched=False, max_mct_size=1200000000):
+    """ Original function to get jitted prob metrics
+
+    DEPRECATED now bc the jitted funcs return all chooser alt-probs, which
+    will run out of memory at ~20k alts.
+    """
+    now = time.time()
+    num_choosers = choosers.shape[0]
+    key_dim = key.shape[0]
+    keys = random.split(key, num_choosers)
+    num_alts = alts.shape[0]
+    mct_size = num_choosers * num_alts
+    batch_size_dict = {20000: 8, 200000: 600, 2000000: 50000}
+
+    gpu_func = interaction_prob_errs_all
+    if (batched) & (mct_size > max_mct_size):
+
+        n_chooser_batches = batch_size_dict[num_alts]
+        choosers_per_batch = int(num_choosers / n_chooser_batches)
+        print(
+            "Computing probabilities in {0} batches of {1} choosers".format(
+                n_chooser_batches, choosers_per_batch))
+        choosers = choosers.reshape(
+            (n_chooser_batches, choosers_per_batch))
+        keys = keys.reshape(
+            (n_chooser_batches, choosers_per_batch, key_dim))
+
+        partial_interaction = partial(
+            gpu_func,
+            alts,
+            coeffs,
+            scale)
+
+        # store results on cpu to preserve space on GPU for computation
+        cpu = devices("cpu")[0]
+        massing_err = device_put(onp.zeros((num_alts, 10)), device=cpu)
+
+        # process chooser batches
+        for i in tqdm(range(n_chooser_batches)):
+            chooser_batch = choosers[i]
+            key_batch = keys[i]
+            errs = vmap(partial_interaction)((chooser_batch, key_batch))
+            massing_err = massing_err + errs.sum(axis=0)
+            del errs
+
+    else:
+        errs = vmap(
+            gpu_func, in_axes=(None, None, None, 0))(
+            alts, coeffs, scale, (choosers, keys))
+        massing_err = errs.sum(axis=0)
+        del errs
+        
+    later = time.time()
+    print(
+        "Took {0} s to compute true probabilities.".format(
+            np.round(later - now), 1))
+
+    tot_abs_err = np.abs(massing_err).sum(axis=0)
+    rmse = np.sqrt(np.mean(massing_err * massing_err, axis=0))
+
+    del massing_err
+
+    return np.vstack((tot_abs_err, rmse)).T
+
+
+def reshape_batched_iter_results(results, num_choosers, num_metric_cols):
+    """ DEPRECATED
+
+    Use reshape_batched_iter_chooser_results instead
+    """
+
+    if len(results) == 2:
+        true_choices = results[0]
+        true_choices = true_choices.reshape((num_choosers,))
+        samp_metrics = results[1]
+        samp_metrics = samp_metrics.reshape((
+            num_choosers, N_SAMP_RATES, num_metric_cols))
+
+        results = (true_choices, samp_metrics)
+
+    else:
+        results = results.reshape((
+            num_choosers, N_SAMP_RATES, num_metric_cols))
+
+    return results
+
+
+def get_iter_probs(choosers, alts, coeffs, key, batched=False, num_metric_cols=14, max_mct_size=1200000000):
+    """ DEPRECATED by method that gets choice counts for alt shares computation
+
+    Use get_iter_chooser_errs_w_choices
+    """
+    now = time.time()
+    num_choosers = choosers.shape[0]
+    key_dim = key.shape[0]
+    keys = random.split(key, num_choosers)
+    num_alts = alts.shape[0]
+    pop_mean_prob = 1 / num_alts
+    mct_size = num_choosers * num_alts
+    if (batched) & (mct_size > max_mct_size):
+        n_chooser_batches = 1
+        while True:
+            n_chooser_batches += 1
+            if num_choosers % n_chooser_batches != 0:
+                continue
+            elif (mct_size / n_chooser_batches) < max_mct_size / 3:
+                break
+        choosers_per_batch = int(num_choosers / n_chooser_batches)
+        print(
+            "Computing probabilities in {0} batches of {1} choosers".format(
+                n_chooser_batches, choosers_per_batch))
+        choosers = choosers.reshape(
+            (n_chooser_batches, choosers_per_batch))
+        keys = keys.reshape(
+            (n_chooser_batches, choosers_per_batch, key_dim))
+
+        partial_interaction = partial(
+            interaction_iters_chooser_err_metrics,
+            alts,
+            coeffs,
+            pop_mean_prob)
+        results = lax.map(
+            vmap(partial_interaction), (choosers, keys))
+        results = reshape_batched_iter_results(
+            results, num_choosers, num_metric_cols)
+
+    else:
+
+        results = vmap(
+            interaction_iters_chooser_err_metrics, in_axes=(
+                None, None, None, 0))(
+            alts, coeffs, pop_mean_prob, (choosers, keys))
+
+    later = time.time()
+    print(
+        "Took {0} s to compute prob. metrics for all sample "
+        "rates by chooser.".format(np.round(later - now)))
+
+    return results
+
+
 @jit
 @remat
-def interaction_iters(
-        alts, coeffs, pop_mean_prob, chooser_val_key, n_splits=10):
+def interaction_iters_chooser_err_metrics(alts, coeffs, pop_mean_prob, chooser_val_key):
+    """ DEPRECATED
+
+    Use interaction_iters_chooser_err_metrics_w_choices
+    """
 
     chooser_val, key = chooser_val_key
     total_alts = alts.shape[0]
@@ -259,17 +611,16 @@ def interaction_iters(
     # sample splits
     alts_idxs = np.arange(total_alts)
     shuffled = swop_exp(key, alts_idxs)
-    samples = np.array_split(shuffled, n_splits)
+    samples = np.array_split(shuffled, N_SAMP_RATES)
 
     # sample probs
     samp_alts_idxs = np.asarray([], dtype=int)
-    result_arr = np.zeros((9, 14))
+    result_arr = np.zeros((N_SAMP_RATES - 1, 14))
     for i, sample in enumerate(samples):
 
-        if i == n_splits - 1:
+        if i == N_SAMP_RATES - 1:
             continue
-
-        sample_rate = (i + 1) / n_splits
+        sample_rate = (i + 1) / N_SAMP_RATES
         sample_size = total_alts * sample_rate
         samp_alts_idxs = np.concatenate((samp_alts_idxs, sample))
         alts3 = alts2[samp_alts_idxs]
@@ -316,92 +667,28 @@ def interaction_iters(
     return result_arr
 
 
-def get_probs(
-        choosers, alts, key, sample_size,
-        batched=False, max_mct_size=1200000000):
-    """VMAP the interaction function over all choosers' values"""
+def get_iter_chooser_errs_w_choices(choosers, alts, coeffs, key, batched=False, num_metric_cols=ERR_METRIC_ROW_SIZE, max_mct_size=1200000000):
+    """ DEPRECATED
 
-    num_choosers = choosers.shape[0]
-    key_dim = key.shape[0]
-    keys = random.split(key, num_choosers)
-    num_alts = alts.shape[0]
-    coeffs = np.array([-1, 1, 1, 1, 1])  # dist-to-cbd, sizes 1-3, intx term
-    pop_mean_prob = 1 / num_alts
-    mct_size = num_choosers * num_alts
-    if (batched) & (mct_size > max_mct_size):
+    Use get_iter_metrics, which combined this method with
+    get_iter_chooser_errs_w_choices
 
-        n_chooser_batches = 1
-        while True:
-            n_chooser_batches += 1
-            if num_choosers % n_chooser_batches != 0:
-                continue
-            elif (mct_size / n_chooser_batches) < max_mct_size / 3:
-                break
-        choosers_per_batch = int(num_choosers / n_chooser_batches)
-        print(
-            "Computing probabilities in {0} batches of {1} choosers".format(
-                n_chooser_batches, choosers_per_batch))
-        choosers = choosers.reshape(
-            (n_chooser_batches, choosers_per_batch))
-        keys = keys.reshape(
-            (n_chooser_batches, choosers_per_batch, key_dim))
+    Computes error metrics for each sample rate, plus the true choices and
+    sample choices for computing alt shares.
 
-        if sample_size < num_alts:
-            partial_interaction = partial(
-                interaction_sample,
-                alts,
-                coeffs,
-                pop_mean_prob,
-                sample_size)
-            results = lax.map(
-                vmap(partial_interaction), (choosers, keys))
-            results = [
-                result.reshape((num_choosers, )) for result in results]
-        else:
-            partial_interaction = partial(
-                interaction,
-                alts,
-                coeffs,
-                pop_mean_prob)
-            results = lax.map(
-                vmap(partial_interaction), (choosers, keys))
-            results = results.reshape((num_choosers, num_alts))
-
-    else:
-        if sample_size < num_alts:
-            results = vmap(
-                interaction_sample, in_axes=(None, None, None, None, 0))(
-                alts, coeffs, pop_mean_prob, sample_size,
-                (choosers, keys))
-        else:
-            results = vmap(
-                interaction, in_axes=(None, None, None, 0))(
-                alts, coeffs, pop_mean_prob, (choosers, keys))
-
-    return results
-
-
-def get_iter_probs(
-        choosers, alts, key, sample_size,
-        batched=False, max_mct_size=1200000000):
-    """VMAP the interaction function over all choosers' values"""
+    Since the array is a matrix of error metrics comparing sampled
+    results to true (unsampled), there are no entries in the matrix for
+    the true (unsampled) results.
+    """
     now = time.time()
     num_choosers = choosers.shape[0]
     key_dim = key.shape[0]
     keys = random.split(key, num_choosers)
     num_alts = alts.shape[0]
-    coeffs = np.array([-1, 1, 1, 1, 1])  # dist-to-cbd, sizes 1-3, intx term
     pop_mean_prob = 1 / num_alts
     mct_size = num_choosers * num_alts
     if (batched) & (mct_size > max_mct_size):
-
-        n_chooser_batches = 1
-        while True:
-            n_chooser_batches += 1
-            if num_choosers % n_chooser_batches != 0:
-                continue
-            elif (mct_size / n_chooser_batches) < max_mct_size / 3:
-                break
+        n_chooser_batches = batch_size_dict[num_alts]
         choosers_per_batch = int(num_choosers / n_chooser_batches)
         print(
             "Computing probabilities in {0} batches of {1} choosers".format(
@@ -412,17 +699,20 @@ def get_iter_probs(
             (n_chooser_batches, choosers_per_batch, key_dim))
 
         partial_interaction = partial(
-            interaction_iters,
+            interaction_iters_chooser_err_metrics_w_choices,
             alts,
             coeffs,
             pop_mean_prob)
         results = lax.map(
             vmap(partial_interaction), (choosers, keys))
-        results = results.reshape((num_choosers, 9, 14))
+        results = reshape_batched_iter_chooser_results(
+            results, num_choosers, N_SAMP_RATES, num_metric_cols)
 
     else:
 
-        results = vmap(interaction_iters, in_axes=(None, None, None, 0))(
+        results = vmap(
+            interaction_iters_chooser_err_metrics_w_choices, in_axes=(
+                None, None, None, 0))(
             alts, coeffs, pop_mean_prob, (choosers, keys))
 
     later = time.time()
@@ -430,4 +720,381 @@ def get_iter_probs(
         "Took {0} s to compute prob. metrics for all sample "
         "rates by chooser.".format(np.round(later - now)))
 
+    return results
+
+
+def get_iter_chooser_probs(choosers, alts, coeffs, key, batched=False, max_mct_size=1200000000):
+    """ DEPRECATED
+
+    Use get_iter_metrics, which combined this method with
+    get_iter_chooser_errs_w_choices
+    """
+
+    now = time.time()
+    num_choosers = choosers.shape[0]
+    key_dim = key.shape[0]
+    keys = random.split(key, num_choosers)
+    num_alts = alts.shape[0]
+    pop_mean_prob = 1 / num_alts
+    mct_size = num_choosers * num_alts
+    if (batched) & (mct_size > max_mct_size):
+        n_chooser_batches = batch_size_dict[num_alts]
+        choosers_per_batch = int(num_choosers / n_chooser_batches)
+        print(
+            "Computing probabilities in {0} batches of {1} choosers".format(
+                n_chooser_batches, choosers_per_batch))
+        choosers = choosers.reshape(
+            (n_chooser_batches, choosers_per_batch))
+        keys = keys.reshape(
+            (n_chooser_batches, choosers_per_batch, key_dim))
+
+        partial_interaction = partial(
+            interaction_iters_chooser_probs,
+            alts,
+            coeffs,
+            pop_mean_prob)
+        results = lax.map(
+            vmap(partial_interaction), (choosers, keys))
+        results = reshape_batched_iter_chooser_results(
+            results, num_choosers, N_SAMP_RATES + 1, CHOOSER_PROB_ROW_SIZE)
+
+    else:
+
+        results = vmap(
+            interaction_iters_chooser_probs, in_axes=(None, None, None, 0))(
+            alts, coeffs, pop_mean_prob, (choosers, keys))
+
+    later = time.time()
+    print(
+        "Took {0} s to compute prob. metrics for all sample "
+        "rates by chooser.".format(np.round(later - now, 1)))
+
+    return results
+
+
+@jit
+@remat
+def interaction_iters_chooser_err_metrics_w_choices(
+        alts, coeffs, pop_mean_prob, chooser_val_key):
+    """ Generate chooser-level error metrics for each sample-rate
+
+    Returns n x 16 matrix of prob-metrics, where n is the number
+    of sample rates used in the experiment. Includes true choice
+    and sample choice columns to faciliate computation of alts
+    shares across population of choosers.
+    """
+
+    chooser_val, key = chooser_val_key
+    total_alts = alts.shape[0]
+
+    # perform interaction
+    idx_alt_intx = -1
+    interacted = np.sqrt(alts[:, idx_alt_intx] / chooser_val)
+    alts2 = alts.at[:, idx_alt_intx].set(interacted)
+
+    # compute probs
+    logits = np.dot(alts2, coeffs.T)
+    probas = softmax(logits)
+    probas = probas.flatten()
+    true_choice = np.nanargmax(probas)
+    true_max = probas[true_choice]
+    pct_true_probs_gt_pop_mean = np.sum(
+        probas > pop_mean_prob) / total_alts
+
+    # sample splits
+    alts_idxs = np.arange(total_alts)
+    shuffled = swop_exp(key, alts_idxs)
+    samples = np.array_split(shuffled, N_SAMP_RATES)
+
+    # sample probs
+    samp_alts_idxs = np.asarray([], dtype=int)
+    result_arr = np.zeros((N_SAMP_RATES, ERR_METRIC_ROW_SIZE))
+    for i, sample in enumerate(samples):
+        sample_rate = (i + 1) / N_SAMP_RATES
+        sample_size = total_alts * sample_rate
+        samp_alts_idxs = np.concatenate((samp_alts_idxs, sample))
+        alts3 = alts2[samp_alts_idxs]
+        samp_logits = np.dot(alts3, coeffs.T)
+        samp_probs = softmax(samp_logits)
+        samp_probs = samp_probs.flatten()
+        samp_max_idx = np.nanargmax(samp_probs)
+        samp_max = samp_probs[samp_max_idx]
+        samp_corr_max = samp_max * sample_rate
+        samp_choice = samp_alts_idxs[samp_max_idx]
+        true_prob_samp_max = probas[samp_choice]
+        pct_samp_probs_gt_pop_mean = np.sum(
+            samp_probs > pop_mean_prob) / sample_size
+        pct_samp_corr_probs_gt_pop_mean = np.sum(
+            (samp_probs * sample_rate) > pop_mean_prob) / sample_size
+
+        tmsm_err = true_prob_samp_max - true_max
+        tmsm_pct_err = tmsm_err / true_max
+        tmsm_sq_err = tmsm_err * tmsm_err
+
+        tmsmc_err = samp_corr_max - true_max
+        tmsmc_pct_err = tmsmc_err / true_max
+        tmsmc_sq_err = tmsmc_err * tmsmc_err
+
+        cf_true = true_prob_samp_max / samp_max
+        cf_err = sample_rate - cf_true
+        cf_pct_err = cf_err / cf_true
+        cf_sq_err = cf_err * cf_err
+
+        ppgm_err = pct_samp_probs_gt_pop_mean - pct_true_probs_gt_pop_mean
+        ppgm_pct_err = ppgm_err / pct_true_probs_gt_pop_mean
+        ppgm_sq_err = ppgm_err * ppgm_err
+
+        pcpgm_err = pct_samp_corr_probs_gt_pop_mean - \
+            pct_true_probs_gt_pop_mean
+        pcpgm_pct_err = pcpgm_err / pct_true_probs_gt_pop_mean
+        pcpgm_sq_err = pcpgm_err * pcpgm_err
+
+        result_arr = result_arr.at[i, :].set(np.array([
+            total_alts, sample_rate, true_choice, samp_choice,
+            tmsm_err, tmsm_pct_err, tmsm_sq_err,
+            tmsmc_err, tmsmc_pct_err, tmsmc_sq_err,
+            cf_err, cf_pct_err, cf_sq_err,
+            ppgm_err, ppgm_pct_err, ppgm_sq_err,
+            pcpgm_err, pcpgm_pct_err, pcpgm_sq_err]))
+
+    del chooser_val
+    del key
+    del chooser_val_key
+    del interacted
+    del alts2
+    del logits
+    del probas
+    del alts_idxs
+    del shuffled
+    del samples
+    del samp_alts_idxs
+    del samp_logits
+    del samp_probs
+
+    return result_arr
+
+
+@jit
+@remat
+def interaction_iters_chooser_probs(
+        alts, coeffs, pop_mean_prob, chooser_val_key):
+    """ Generate chooser-level choices/max. probs plus metrics (e.g.
+        ppgm, dispersion err) that can only be computed when the
+        full probs are available.
+
+    Returns n x 5 matrix of prob-metrics, where n is 1 + the
+    number of sample rates used in the experiment.
+    """
+
+    chooser_val, key = chooser_val_key
+    total_alts = alts.shape[0]
+
+    # perform interaction
+    idx_alt_intx = -1
+    interacted = np.sqrt(alts[:, idx_alt_intx] / chooser_val)
+    alts2 = alts.at[:, idx_alt_intx].set(interacted)
+
+    # compute probs
+    logits = np.dot(alts2, coeffs.T)
+    probas = softmax(logits)
+    probas = probas.flatten()
+    true_choice = np.nanargmax(probas)
+    true_max = probas[true_choice]
+    pct_true_probs_gt_pop_mean = np.sum(
+        probas > pop_mean_prob) / total_alts
+    result_arr = np.array([
+        -1, true_choice, true_max, np.nan, pct_true_probs_gt_pop_mean, np.nan])
+
+    # sample splits
+    alts_idxs = np.arange(total_alts)
+    shuffled = swop_exp(key, alts_idxs)
+    samples = np.array_split(shuffled, N_SAMP_RATES)
+
+    # sample probs
+    samp_alts_idxs = np.asarray([], dtype=int)
+    for i, sample in enumerate(samples):
+        sample_rate = (i + 1) / N_SAMP_RATES
+        sample_size = total_alts * sample_rate
+        samp_alts_idxs = np.concatenate((samp_alts_idxs, sample))
+        alts3 = alts2[samp_alts_idxs]
+        samp_logits = np.dot(alts3, coeffs.T)
+        samp_probs = softmax(samp_logits)
+        samp_probs = samp_probs.flatten()
+        samp_max_idx = np.nanargmax(samp_probs)
+        samp_max_prob = samp_probs[samp_max_idx]
+        samp_choice = samp_alts_idxs[samp_max_idx]
+        true_prob_samp_max = probas[samp_choice]
+        pct_samp_probs_gt_pop_mean = np.sum(
+            samp_probs > pop_mean_prob) / sample_size
+        pct_samp_corr_probs_gt_pop_mean = np.sum(
+            samp_probs * sample_rate > pop_mean_prob) / sample_size
+
+        result_arr = np.vstack((result_arr, [
+            sample_rate, samp_choice, samp_max_prob, true_prob_samp_max,
+            pct_samp_probs_gt_pop_mean, pct_samp_corr_probs_gt_pop_mean]))
+
+    del chooser_val
+    del key
+    del chooser_val_key
+    del interacted
+    del alts2
+    del logits
+    del probas
+    del alts_idxs
+    del shuffled
+    del samples
+    del samp_alts_idxs
+    del samp_logits
+    del samp_probs
+
+    return result_arr
+
+
+@jit
+@remat
+def interaction_iters_chooser_probs_w_massing(
+        alts, coeffs, pop_mean_prob, alt_err_totals, chooser_val_key):
+    """ Generate chooser-level choices/max. probs plus metrics (e.g.
+        ppgm, dispersion err) that can only be computed when the
+        full probs are available.
+
+    Returns n x 5 matrix of prob-metrics, where n is 1 + the
+    number of sample rates used in the experiment.
+    """
+
+    chooser_val, key = chooser_val_key
+    total_alts = alts.shape[0]
+
+    # perform interaction
+    idx_alt_intx = -1
+    interacted = np.sqrt(alts[:, idx_alt_intx] / chooser_val)
+    alts2 = alts.at[:, idx_alt_intx].set(interacted)
+
+    # compute probs
+    logits = np.dot(alts2, coeffs.T)
+    probas = softmax(logits)
+    probas = probas.flatten()
+    true_choice = np.nanargmax(probas)
+    true_max = probas[true_choice]
+    pct_true_probs_gt_pop_mean = np.sum(
+        probas > pop_mean_prob) / total_alts
+    result_arr = np.array([
+        -1, true_choice, true_max, np.nan, pct_true_probs_gt_pop_mean, np.nan])
+
+    # sample splits
+    alts_idxs = np.arange(total_alts)
+    shuffled = swop_exp(key, alts_idxs)
+    samples = np.array_split(shuffled, N_SAMP_RATES)
+
+    # sample probs
+    samp_alts_idxs = np.asarray([], dtype=int)
+    for i, sample in enumerate(samples):
+        probs_samp_sparse = np.zeros_like(probas)
+        sample_rate = (i + 1) / N_SAMP_RATES
+        sample_size = total_alts * sample_rate
+        samp_alts_idxs = np.concatenate((samp_alts_idxs, sample))
+        alts3 = alts2[samp_alts_idxs]
+        samp_logits = np.dot(alts3, coeffs.T)
+        samp_probs = softmax(samp_logits)
+        samp_probs = samp_probs.flatten()
+        probs_samp_sparse = probs_samp_sparse.at[samp_alts_idxs].set(samp_probs)
+        probs_err = (probs_samp_sparse - probas)
+        err_totals = alt_err_totals.at[i, :].get()
+        new_err_total = err_totals + probs_err
+        alt_err_totals = alt_err_totals.at[i, :].set(new_err_total)
+        samp_max_idx = np.nanargmax(samp_probs)
+        samp_max_prob = samp_probs[samp_max_idx]
+        samp_choice = samp_alts_idxs[samp_max_idx]
+        true_prob_samp_max = probas[samp_choice]
+        pct_samp_probs_gt_pop_mean = np.sum(
+            samp_probs > pop_mean_prob) / sample_size
+        pct_samp_corr_probs_gt_pop_mean = np.sum(
+            samp_probs * sample_rate > pop_mean_prob) / sample_size
+
+        result_arr = np.vstack((result_arr, [
+            sample_rate, samp_choice, samp_max_prob, true_prob_samp_max,
+            pct_samp_probs_gt_pop_mean, pct_samp_corr_probs_gt_pop_mean]))
+
+    del chooser_val
+    del key
+    del chooser_val_key
+    del interacted
+    del alts2
+    del logits
+    del probas
+    del alts_idxs
+    del shuffled
+    del samples
+    del samp_alts_idxs
+    del samp_logits
+    del samp_probs
+
+    return result_arr
+
+
+def reshape_batched_iter_chooser_results(
+        results, num_choosers, num_sample_iters, num_metric_cols):
+    results = results.reshape((
+        num_choosers, num_sample_iters, num_metric_cols))
+
+    return onp.array(results)
+
+
+def get_iter_metrics(
+        choosers, alts, coeffs, key,
+        batched=False, max_mct_size=1200000000, gpu_func='probs'):
+
+    num_choosers = choosers.shape[0]
+    key_dim = key.shape[0]
+    keys = random.split(key, num_choosers)
+    num_alts = alts.shape[0]
+    pop_mean_prob = 1 / num_alts
+    mct_size = num_choosers * num_alts
+
+    # compute err metrics one chooser at a time inside the jitted function
+    if gpu_func == 'errs':
+        batch_size_dict = {20000: 6, 200000: 600, 2000000: 60000}
+        interaction_func = interaction_iters_chooser_err_metrics_w_choices
+        num_metric_cols = ERR_METRIC_ROW_SIZE
+        n_samp_idxs = N_SAMP_RATES
+
+    # jitted function just gets prob metrics for each chooser. error
+    # metrics for each sample rate are computed on CPU for all choosers
+    # at once and then stored to disk. requires an extra post-processing
+    # step, but it reduces the GPU memory footprint which allows us to
+    # process the choosers in fewer, larger batches, reducing runtimes.
+    elif gpu_func == 'probs':
+        batch_size_dict = {20000: 5, 200000: 500, 2000000: 50000}
+        interaction_func = interaction_iters_chooser_probs_w_massing
+        alt_err_totals = np.zeros((N_SAMP_RATES, num_alts))
+        num_metric_cols = CHOOSER_PROB_ROW_SIZE
+        n_samp_idxs = N_SAMP_RATES + 1
+
+    if (batched) & (mct_size > max_mct_size):
+        n_chooser_batches = batch_size_dict[num_alts]
+        choosers_per_batch = int(num_choosers / n_chooser_batches)
+        print(
+            "Computing probabilities in {0} batches of {1} choosers".format(
+                n_chooser_batches, choosers_per_batch))
+        choosers = choosers.reshape(
+            (n_chooser_batches, choosers_per_batch))
+        keys = keys.reshape(
+            (n_chooser_batches, choosers_per_batch, key_dim))
+
+        partial_interaction = partial(
+            interaction_func,
+            alts,
+            coeffs,
+            pop_mean_prob, alt_err_totals)
+        results = lax.map(
+            vmap(partial_interaction), (choosers, keys))
+        results = reshape_batched_iter_chooser_results(
+            results, num_choosers, n_samp_idxs, num_metric_cols)
+
+    else:
+
+        results = vmap(
+            interaction_func, in_axes=(None, None, None, None, 0))(
+            alts, coeffs, pop_mean_prob, alt_err_totals, (choosers, keys))
+    breakpoint()
     return results
