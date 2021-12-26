@@ -117,14 +117,17 @@ def run_v2(
     for i, samp_rate in enumerate(sample_rates):
         samp_prob_mass = all_prob_mass[i, :]
         samp_prob_mass_std = samp_prob_mass.std()
-        massing_err = (samp_prob_mass - true_prob_mass)
-        total_massing_err = np.abs(massing_err).sum()
+        massing_err = (samp_prob_mass - true_prob_mass)  # 1 x n_choosers
+        total_massing_err = np.abs(
+            massing_err).sum()  # scales w/ num choosers (i)
+        pct_tot_massing_err = total_massing_err / num_choosers
         rmse = np.sqrt(np.mean(massing_err * massing_err))
         mape = np.nanmean(np.abs(massing_err / true_prob_mass))
         stddev_err = samp_prob_mass_std - true_prob_mass_std
         stddev_pct_err = stddev_err / true_prob_mass_std
         err_metrics.append([
-            samp_rate, total_massing_err, rmse, mape, stddev_pct_err])
+            samp_rate, total_massing_err, pct_tot_massing_err, rmse,
+            mape, stddev_pct_err])
 
     later = time.time()
     if verbose:
@@ -134,7 +137,8 @@ def run_v2(
 
     iter_df = pd.DataFrame(
         err_metrics, columns=[
-        'sample_rate', 'total_abs_err', 'rmse', 'mape', 'sd_pct_err'])
+            'sample_rate', 'total_abs_err', 'pct_abs_err', 'rmse',
+            'mape', 'sd_pct_err'])
     iter_df['num_alts'] = num_alts
     iter_df['num_choosers'] = num_choosers
 
