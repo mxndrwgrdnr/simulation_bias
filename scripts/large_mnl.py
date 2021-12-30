@@ -79,6 +79,15 @@ def interact_choosers_alts(chooser_val, alts, alt_intx_idx=-1):
     return alts2
 
 
+@jit
+def interact_choosers_alts_disc(chooser_val, alts, alt_intx_idx=3):
+
+    interacted = alts[:, alt_intx_idx] * chooser_val
+    alts2 = alts.at[:, alt_intx_idx].set(interacted)
+
+    return alts2
+
+
 def interaction_sample_utils(
         alts, coeffs, scale, sample_size, chooser_val_key):
     """ Compute logit utils with SAMPLING of alts.
@@ -165,6 +174,56 @@ def interaction_probs_all(alts, coeffs, scale, chooser_val_key):
 
     # interact choosers/alts
     full_data = interact_choosers_alts(chooser_val, alts)
+
+    # interact and take dot product
+    full_utils = np.dot(full_data, coeffs.T) * scale
+
+    # sample splits
+    alts_idxs = np.arange(total_alts)
+    shuffled = swop_exp(key, alts_idxs)
+    samples = np.array_split(shuffled, N_SAMP_RATES)
+
+    result_arr = np.zeros((N_SAMP_RATES, total_alts), dtype=np.float32)
+    samp_alts_idxs = np.asarray([], dtype=int)
+    for i, sample in enumerate(samples):
+
+        samp_alts_idxs = np.concatenate((samp_alts_idxs, sample))
+
+        # compute sample probs
+        samp_utils = full_utils[samp_alts_idxs]
+        samp_probs = softmax(samp_utils).flatten()
+        del samp_utils
+
+        # sparsify
+        probs_samp_sparse = np.zeros_like(full_utils, dtype=np.float32)
+        probs_samp_sparse = probs_samp_sparse.at[samp_alts_idxs].set(
+            samp_probs)
+        del samp_probs
+
+        result_arr = result_arr.at[i, :].set(probs_samp_sparse)
+
+        del probs_samp_sparse
+
+    # cleanup
+    del full_utils
+    del full_data
+    del alts_idxs
+    del shuffled
+    del samples
+    del samp_alts_idxs
+
+    return result_arr
+
+
+@jit
+def interaction_probs_all_disc(alts, coeffs, scale, chooser_val_key):
+    """ For discretionary activity location choice
+    """
+    total_alts = alts.shape[0]
+    chooser_val, key = chooser_val_key
+
+    # interact choosers/alts
+    full_data = interact_choosers_alts_disc(chooser_val, alts)
 
     # interact and take dot product
     full_utils = np.dot(full_data, coeffs.T) * scale
