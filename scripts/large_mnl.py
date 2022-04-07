@@ -11,7 +11,7 @@ ERR_METRIC_ROW_SIZE = 19
 CHOOSER_PROB_ROW_SIZE = 6
 
 
-def softmax(u, scale=1, corr_factor=1):
+def softmax(u, corr_factor=0):
     """
     Probability equation for multinomial logit.
 
@@ -26,8 +26,8 @@ def softmax(u, scale=1, corr_factor=1):
     ----------
     (array) Probabilites for each alternative
     """
-    exp_utility = np.exp(u * scale)
-    sum_exp_utility = np.sum(exp_utility * corr_factor, keepdims=True)
+    exp_utility = np.exp(u - corr_factor)
+    sum_exp_utility = np.sum(exp_utility, keepdims=True)
     proba = exp_utility / sum_exp_utility
     return proba
 
@@ -80,7 +80,7 @@ def interact_choosers_alts(chooser_val, alts, alt_intx_idx=-1):
 
 
 @jit
-def interact_choosers_alts_disc(chooser_val, alts, alt_intx_idx=3):
+def interact_choosers_alts_disc(chooser_val, alts, alt_intx_idx=-1):
 
     interacted = alts[:, alt_intx_idx] * chooser_val
     alts2 = alts.at[:, alt_intx_idx].set(interacted)
@@ -392,8 +392,59 @@ def interaction_probs_all_w_half_max(alts, coeffs, scale, chooser_val_key):
 
 @jit
 def interaction_probs_all_weighted(alts, coeffs, scale, chooser_val_key):
-    """ n-1 samp + max
+    """ resample according to true probs
     """
+    total_alts = alts.shape[0]
+    chooser_val, key = chooser_val_key
+
+    # interact choosers/alts
+    full_data = interact_choosers_alts(chooser_val, alts)
+
+    # take dot product and apply scale param
+    full_utils = np.dot(full_data, coeffs.T) * scale
+    del full_data
+
+    # true probs
+    true_probs = softmax(full_utils).flatten()
+
+    # sample
+    alts_idxs = np.arange(total_alts)
+    result_arr = np.zeros((N_SAMP_RATES, total_alts), dtype=np.float32)
+    result_arr = result_arr.at[9, :].set(true_probs)
+
+    for i in range(9):
+        n_samp = int((i + 1) * .1 * total_alts)
+        samp_alts_idxs = random.choice(
+            key, alts_idxs, (n_samp,), replace=False, p=true_probs)
+
+        # compute sample probs
+        samp_utils = full_utils[samp_alts_idxs] - np.log(1 / true_probs[samp_alts_idxs])
+        samp_probs = softmax(samp_utils).flatten()
+        del samp_utils
+
+        # sparsify
+        probs_samp_sparse = np.zeros_like(full_utils, dtype=np.float32)
+        probs_samp_sparse = probs_samp_sparse.at[samp_alts_idxs].set(samp_probs)
+        del samp_probs
+
+        result_arr = result_arr.at[i, :].set(probs_samp_sparse)
+
+        del probs_samp_sparse
+
+    # cleanup
+    del full_utils
+    del alts_idxs
+    del samp_alts_idxs
+    del true_probs
+
+    return result_arr
+
+
+@jit
+def interaction_probs_all_strat(alts, coeffs, scale, chooser_val_key):
+    """ resample according to true probs
+    """
+    num_strata = 10
     total_alts = alts.shape[0]
     chooser_val, key = chooser_val_key
 
@@ -407,6 +458,10 @@ def interaction_probs_all_weighted(alts, coeffs, scale, chooser_val_key):
     # true probs
     true_probs = softmax(full_utils).flatten()
 
+    # strata probs
+    idxs_sorted = np.argsort(true_probs)
+    strata = np.array_split(idxs_sorted, num_strata)
+
     # sample
     alts_idxs = np.arange(total_alts)
     result_arr = np.zeros((N_SAMP_RATES, total_alts), dtype=np.float32)
@@ -414,11 +469,18 @@ def interaction_probs_all_weighted(alts, coeffs, scale, chooser_val_key):
 
     for i in range(9):
         n_samp = (i + 1) * .1 * total_alts
-        samp_alts_idxs = random.choice(
-            key, alts_idxs, (int(n_samp),), replace=False, p=true_probs)
+        samp_alts_idxs = np.zeros(int(n_samp), dtype=int)
+        strata_n_samp = int(n_samp / num_strata)
+        for s in range(num_strata):
+            strata_samp_idxs = random.choice(key, strata[s], (strata_n_samp,), replace=False)
+            start_idx = s * strata_n_samp
+            end_idx = start_idx + strata_n_samp
+            samp_alts_idxs = samp_alts_idxs.at[start_idx:end_idx].set(strata_samp_idxs)
+            # samp_alts_idxs = random.choice(
+            #     key, alts_idxs, (int(n_samp),), replace=False, p=strat_probs)
 
         # compute sample probs
-        samp_utils = full_utils[samp_alts_idxs]
+        samp_utils = full_utils[samp_alts_idxs] #+ np.log(strat_probs[samp_alts_idxs])
         samp_probs = softmax(samp_utils).flatten()
         del samp_utils
 
@@ -450,7 +512,7 @@ def interaction_prob_errs_all(alts, coeffs, scale, chooser_val_key):
     full_data = interact_choosers_alts(chooser_val, alts)
 
     true_utils = interaction_utils(alts, coeffs, scale, chooser_val)
-    true_probs = softmax(true_utils, scale).flatten()
+    true_probs = softmax(true_utils, scale=scale).flatten()
     true_probs_sd = true_probs.std()
 
     # sample splits
@@ -497,7 +559,7 @@ def interaction_prob_errs_all(alts, coeffs, scale, chooser_val_key):
 
 def get_probs(
         choosers, alts, coeffs, key, sample_size=None,
-        scale=1, utils=False, batched=False, sum_probs=False,
+        scale=1, utils=False, hed=False, sum_probs=False,
         max_mct_size=1200000000):
     """ Original function to get jitted prob metrics
 
@@ -614,17 +676,28 @@ def get_all_probs(
     keys = random.split(key, num_choosers)
     num_alts = alts.shape[0]
     mct_size = num_choosers * num_alts
-    batch_size_dict = {20000: 8, 200000: 750, 2000000: 75000}
+    batch_size_dict = {
+        20000: 8,
+        200000: 750,
+        750000: 8,
+        2000000: int(num_choosers / 100) if num_choosers % 100 == 0 else int(num_choosers / 75),
+        7500000: 7500
+        }
     gpu_func = interaction_probs_all
-    # batch_size_dict = {20000: 8, 200000: 1000, 2000000: 75000}
+    batch_size_dict = {20000: 8, 200000: 1000, 2000000: 75000}
     # gpu_func = interaction_probs_all_w_max
     # batch_size_dict = {20000: 10, 200000: 1000, 2000000: 75000}
     # gpu_func = interaction_probs_all_w_half_max
-    # batch_size_dict = {20000: 10, 200000: 1000, 2000000: 75000}
+    # batch_size_dict = {20000: 10, 200000: 1000, 2000000: 100000}
     # gpu_func = interaction_probs_all_weighted
+    # gpu_func = interaction_probs_all_strat
     if (batched) & (mct_size > max_mct_size):
 
-        n_chooser_batches = batch_size_dict[num_alts]
+        if len(str(num_choosers)) > len(str(num_alts)):
+            batch_size_lookup = num_choosers
+        else:
+            batch_size_lookup = num_alts 
+        n_chooser_batches = batch_size_dict[batch_size_lookup]
         choosers_per_batch = int(num_choosers / n_chooser_batches)
         if verbose:
             print(
@@ -647,25 +720,20 @@ def get_all_probs(
         results = device_put(onp.zeros((10, num_alts)), device=cpu)
 
         # process chooser batches
-        if verbose:
-            for i in tqdm(range(n_chooser_batches)):
-                chooser_batch = choosers[i]
-                key_batch = keys[i]
-                probs = vmap(partial_interaction)((chooser_batch, key_batch))
-                results = results + probs.sum(axis=0)
-                del probs
-        else:
-            for i in range(n_chooser_batches):
-                chooser_batch = choosers[i]
-                key_batch = keys[i]
-                probs = vmap(partial_interaction)((chooser_batch, key_batch))
-                results = results + probs.sum(axis=0)
-                del probs
+        disable = not verbose
+        for i in tqdm(range(n_chooser_batches), disable=disable):
+            chooser_batch = choosers[i]
+            key_batch = keys[i]
+            probs = vmap(partial_interaction)((chooser_batch, key_batch))
+            assert np.isclose(np.nansum(probs, axis=2), 1.0).all()
+            results = results + np.nansum(probs, axis=0)
+            del probs
 
     else:
         results = vmap(
             gpu_func, in_axes=(None, None, None, 0))(
             alts, coeffs, scale, (choosers, keys))
+        assert np.isclose(np.nansum(results, axis=2), 1.0).all()
         results = results.sum(axis=0)
 
     later = time.time()

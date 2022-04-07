@@ -5,6 +5,7 @@ import time
 from jax.lib import xla_bridge
 import argparse
 import os
+from scipy.stats import ks_2samp, epps_singleton_2samp, kurtosis, skew
 
 import large_mnl as lmnl
 
@@ -38,13 +39,14 @@ def create_data(num_alts, num_choosers, num_vars=5):
 
 
 def run(
-        num_alts, pop_to_alts_ratio, sample_rates, coeffs,
-        key, batched, gpu_func):
+        num_alts, sample_rates, coeffs,
+        key, batched, gpu_func, num_choosers=None, pop_to_alts_ratio=None):
     """ Get probs for one sample rate at a time
     """
 
     num_alts = int(num_alts)
-    num_choosers = int(pop_to_alts_ratio * num_alts)
+    if num_choosers is None:
+        num_choosers = int(pop_to_alts_ratio * num_alts)
     choosers, alts = create_data(num_alts, num_choosers)
     num_choosers = choosers.shape[0]
     print(num_alts, " ALTS, ", num_choosers, " CHOOSERS")
@@ -85,13 +87,12 @@ def run(
 
 
 def run_v2(
-        num_alts, pop_to_alts_ratio, sample_rates, coeffs,
+        num_alts, num_choosers, sample_rates, coeffs,
         key, batched, scale=1, debug=True, verbose=True):
     """ Get probs for all sample rates at once
     """
 
     num_alts = int(num_alts)
-    num_choosers = int(pop_to_alts_ratio * num_alts)
     choosers, alts = create_data(num_alts, num_choosers)
     num_choosers = choosers.shape[0]
     if verbose:
@@ -111,23 +112,31 @@ def run_v2(
         assert any(np.isnan(true_prob_mass)) is False
 
     true_prob_mass_std = true_prob_mass.std()
+    true_kurt = kurtosis(true_prob_mass)
+    true_skew = skew(true_prob_mass)
 
     err_metrics = []
     now = time.time()
     for i, samp_rate in enumerate(sample_rates):
         samp_prob_mass = all_prob_mass[i, :]
         samp_prob_mass_std = samp_prob_mass.std()
-        massing_err = (samp_prob_mass - true_prob_mass)  # 1 x n_choosers
+        massing_err = (samp_prob_mass - true_prob_mass)  # 1 x n_alts
         total_massing_err = np.abs(
-            massing_err).sum()  # scales w/ num choosers (i)
-        pct_tot_massing_err = total_massing_err / num_choosers
+            massing_err).sum()  # scales w/ num choosers (i) and num_alts
+        pct_tot_massing_err = total_massing_err / num_choosers  # scales with num alts
         rmse = np.sqrt(np.mean(massing_err * massing_err))
         mape = np.nanmean(np.abs(massing_err / true_prob_mass))
         stddev_err = samp_prob_mass_std - true_prob_mass_std
         stddev_pct_err = stddev_err / true_prob_mass_std
+        ks_stat, ks_pval = ks_2samp(true_prob_mass, samp_prob_mass)
+        es_stat, es_pval = epps_singleton_2samp(true_prob_mass, samp_prob_mass)
+        samp_kurt = kurtosis(samp_prob_mass)
+        samp_skew = skew(samp_prob_mass)
         err_metrics.append([
             samp_rate, total_massing_err, pct_tot_massing_err, rmse,
-            mape, stddev_pct_err])
+            mape, stddev_pct_err, true_prob_mass_std, samp_prob_mass_std,
+            ks_stat, ks_pval, es_stat, es_pval, true_skew, samp_skew,
+            true_kurt, samp_kurt])
 
     later = time.time()
     if verbose:
@@ -138,7 +147,7 @@ def run_v2(
     iter_df = pd.DataFrame(
         err_metrics, columns=[
             'sample_rate', 'total_abs_err', 'pct_abs_err', 'rmse',
-            'mape', 'sd_pct_err'])
+            'mape', 'sd_pct_err', 'true_sd', 'samp_sd', 'ks_stat', 'ks_pval'])
     iter_df['num_alts'] = num_alts
     iter_df['num_choosers'] = num_choosers
 
